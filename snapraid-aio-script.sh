@@ -40,7 +40,7 @@ SNAPSCRIPTVERSION="3.4" #DEV24
 CURRENT_DIR=$(dirname "${0}")
 
 # Default argument values
-CONFIG_FILE="$CURRENT_DIR/script-config.conf"
+CONFIG_FILE="$CURRENT_DIR/snapraid-aio-conf.conf"
 FORCE_SYNC=false
 
 SYNC_MARKER="SYNC -"
@@ -218,12 +218,17 @@ fi
   mklog "INFO: Checking SnapRAID Status"
   check_snapraid_status
   if [ $SNAPRAID_STATUS -eq 1 ]; then
-    # Stop the script due to warning
-    echo "Stopping the script because the previous SnapRAID sync did not complete correctly."
-    SUBJECT="[WARNING] - Previous SnapRAID sync did not complete correctly."
-    NOTIFY_OUTPUT="$SUBJECT"
-    notify_warning "fatal"
-    exit 1;
+    # Stop the script due to warning (unless retry incomplete sync is enabled)
+    if [ "$RETRY_INCOMPLETE_SYNC" -eq 1 ]; then
+      echo "Array is not fully synced, but RETRY_INCOMPLETE_SYNC is enabled. Attempting to complete the sync."
+      mklog "INFO: Array not fully synced. RETRY_INCOMPLETE_SYNC enabled - will attempt to complete sync."
+    else
+      echo "Stopping the script because the previous SnapRAID sync did not complete correctly."
+      SUBJECT="[WARNING] - Previous SnapRAID sync did not complete correctly."
+      NOTIFY_OUTPUT="$SUBJECT"
+      notify_warning "fatal"
+      exit 1;
+    fi
     
   elif [ $SNAPRAID_STATUS -eq 2 ]; then
     # Handle unknown status
@@ -310,35 +315,11 @@ fi
   # Now run sync if conditions are met
   if [ "$DO_SYNC" -eq 1 ]; then
     echo "SYNC is authorized. [$(date)]"
-    echo "### SnapRAID SYNC [$(date)]"
-    mklog "INFO: SnapRAID SYNC Job started"
-    echo "\`\`\`"
-    if [ "$PREHASH" -eq 1 ] && [ "$FORCE_ZERO" -eq 1 ]; then
-      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -h --force-zero -q sync
-    elif [ "$PREHASH" -eq 1 ]; then
-      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -h -q sync
-    elif [ "$FORCE_ZERO" -eq 1 ]; then
-      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" --force-zero -q sync
-    else
-      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -q sync
+    if [ "$MAX_SYNC_RETRIES" -gt 0 ]; then
+      echo "Automatic retry is enabled. SYNC will retry up to $MAX_SYNC_RETRIES times if it fails at 99%."
+      mklog "INFO: Automatic SYNC retry enabled - max retries: $MAX_SYNC_RETRIES"
     fi
-    close_output_and_wait
-    output_to_file_screen
-    echo "\`\`\`"
-    echo "SYNC finished [$(date)]"
-    mklog "INFO: SnapRAID SYNC Job finished"
-    JOBS_DONE="$JOBS_DONE + SYNC"
-    # insert SYNC marker to 'Everything OK' or 'Nothing to do' string to
-    # differentiate it from SCRUB job later
-    sed_me "
-      s/^Everything OK/${SYNC_MARKER} Everything OK/g;
-      s/^Nothing to do/${SYNC_MARKER} Nothing to do/g" "$TMP_OUTPUT"
-    # Remove any warning flags if set previously. This is done in this step to
-    # take care of scenarios when user has manually synced or restored deleted
-    # files and we will have missed it in the checks above.
-    if [ -e "$SYNC_WARN_FILE" ]; then
-      rm "$SYNC_WARN_FILE"
-    fi
+    run_sync_with_retry
   fi
 
   # Moving onto scrub now. Check if user has enabled scrub
@@ -507,6 +488,83 @@ sanity_check() {
   done
   echo "All content files found."
   mklog "INFO: All content files found."
+}
+
+run_sync_with_retry() {
+  # Function to run SnapRAID sync with automatic retry on failure
+  # Retries if sync completes without the success marker (99% failure)
+  local retry_count=0
+  local max_retries=$MAX_SYNC_RETRIES
+  local retry_delay=$SYNC_RETRY_DELAY
+  local sync_success=0
+
+  # Clear the temporary output file before starting
+  true > "$TMP_OUTPUT"
+
+  while [ $retry_count -le $max_retries ]; do
+    if [ $retry_count -gt 0 ]; then
+      echo "Retry attempt $retry_count of $max_retries [$(date)]"
+      mklog "INFO: SnapRAID SYNC retry attempt $retry_count of $max_retries"
+      echo "Waiting $retry_delay seconds before retry..."
+      sleep "$retry_delay"
+      # Clear output for fresh attempt
+      true > "$TMP_OUTPUT"
+    fi
+
+    echo "### SnapRAID SYNC [$(date)]"
+    mklog "INFO: SnapRAID SYNC Job started"
+    echo "\`\`\`"
+    
+    # Run the sync command with appropriate flags
+    if [ "$PREHASH" -eq 1 ] && [ "$FORCE_ZERO" -eq 1 ]; then
+      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -h --force-zero -q sync
+    elif [ "$PREHASH" -eq 1 ]; then
+      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -h -q sync
+    elif [ "$FORCE_ZERO" -eq 1 ]; then
+      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" --force-zero -q sync
+    else
+      "$SNAPRAID_BIN" -c "$SNAPRAID_CONF" -q sync
+    fi
+    
+    close_output_and_wait
+    output_to_file_screen
+    echo "\`\`\`"
+    echo "SYNC finished [$(date)]"
+    mklog "INFO: SnapRAID SYNC Job finished"
+
+    # Check if sync was successful by looking for the success marker
+    if grep -qw "Everything OK\|Nothing to do" "$TMP_OUTPUT"; then
+      # Sync succeeded - add marker and exit retry loop
+      sed_me "
+        s/^Everything OK/${SYNC_MARKER} Everything OK/g;
+        s/^Nothing to do/${SYNC_MARKER} Nothing to do/g" "$TMP_OUTPUT"
+      sync_success=1
+      break
+    else
+      # Sync failed to complete successfully
+      if [ $retry_count -lt $max_retries ]; then
+        echo "**WARNING** - SYNC did not complete successfully. Retrying..."
+        mklog "WARN: SYNC did not complete successfully. Will retry."
+        ((retry_count++))
+      else
+        # This was the last attempt
+        echo "**WARNING** - SYNC did not complete successfully after $((retry_count + 1)) attempt(s)."
+        mklog "WARN: SYNC did not complete successfully after $((retry_count + 1)) attempt(s)."
+        break
+      fi
+    fi
+  done
+
+  # Add sync marker if successful
+  if [ $sync_success -eq 1 ]; then
+    JOBS_DONE="$JOBS_DONE + SYNC"
+    # Remove any warning flags if set previously
+    if [ -e "$SYNC_WARN_FILE" ]; then
+      rm "$SYNC_WARN_FILE"
+    fi
+  fi
+
+  return $((1 - sync_success))
 }
 
 get_counts() {
